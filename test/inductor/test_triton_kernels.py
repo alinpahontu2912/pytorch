@@ -1003,6 +1003,47 @@ def forward(self, x_1, output_1):
         else:
             self.assertTrue("equal_to_1=(3,)" in sources[0])
             self.assertTrue("ids_of_folded_args=(3,)" in sources[0])
+        self.assertEqual(compiled_out, eager_out)
+
+    @requires_cuda
+    @skipIfRocm
+    @common_utils.parametrize("size", [4, 16])
+    @common_utils.parametrize("dynamic", [False, True])
+    def test_triton_kernel_different_shapes(self, size, dynamic):
+        from torch._inductor.utils import run_and_get_code
+
+        def f(x, y, xx, yy):
+            n_elements = x.numel()
+            output_1 = torch.zeros_like(x)
+            grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+            add_kernel[grid](x, y, output_1, n_elements, BLOCK_SIZE=4)
+
+            n_elements = xx.numel()
+            output_2 = torch.zeros_like(xx)
+            grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+            add_kernel[grid](xx, yy, output_2, n_elements, BLOCK_SIZE=4)
+
+            return output_1, output_2
+
+        x = torch.rand(size, device="cuda")
+        y = torch.rand(size, device="cuda")
+        xx = torch.rand(size, size, device="cuda")
+        yy = torch.rand(size, size, device="cuda")
+        args = [x, y, xx, yy]
+
+        eager_out = f(*args)
+        compiled_out, (code,) = run_and_get_code(
+            torch.compile(f, fullgraph=True, dynamic=dynamic, backend="inductor"), *args
+        )
+        if size == 4 and not dynamic:
+            # Produce 2 kernels due to divisibility
+            self.assertTrue("add_kernel_0.run" in code)
+            self.assertTrue("add_kernel_1.run" in code)
+        else:
+            # size == 16 or dynamic
+            # Only one kernel
+            self.assertTrue("add_kernel_0.run" in code)
+            self.assertTrue("add_kernel_1.run" not in code)
 
         self.assertEqual(compiled_out, eager_out)
 
