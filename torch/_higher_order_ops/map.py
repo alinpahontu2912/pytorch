@@ -1,21 +1,19 @@
-from contextlib import nullcontext
-
 import torch
 import torch.utils._pytree as pytree
 from torch._C import DispatchKey
 from torch._dispatch.python import suspend_functionalization
 from torch._functorch.aot_autograd import AOTConfig, create_joint, from_fun
 
-from torch._higher_order_ops.cond import (
+from torch._higher_order_ops.utils import (
     _has_potential_branch_input_alias,
     _has_potential_branch_input_mutation,
+    reenter_make_fx,
     UnsupportedAliasMutationException,
 )
 from torch._ops import HigherOrderOperator
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch._subclasses.functional_tensor import (
     FunctionalTensor,
-    FunctionalTensorMode,
     unset_functional_temporarily,
 )
 from torch.fx.experimental.proxy_tensor import (
@@ -95,7 +93,8 @@ def create_fw_bw_graph(f, num_mapped_args, *args):
                         return maybe_unfunc_t.clone()
                 return t
 
-            example_xs = [_from_fun(xs) for xs in _unstack_pytree(mapped_xs)[0]]
+            unwrapped_mapped_xs = pytree.tree_map(_from_fun, mapped_xs)
+            example_xs = _unstack_pytree(unwrapped_mapped_xs)[0]
 
             example_pos_args = [
                 _from_fun(arg) if isinstance(arg, torch.Tensor) else arg
@@ -230,8 +229,9 @@ def trace_map(proxy_mode, func_overload, f, xs, pos_args):
 
     example_input = _unstack_pytree(xs)[0]
     body_graph = f
-    if not isinstance(body_graph, torch.fx.GraphModule):
-        body_graph = make_fx(body_graph)(*example_input, *pos_args)
+
+    pre_dispatch = getattr(proxy_mode, "pre_dispatch", False)
+    body_graph = reenter_make_fx(body_graph, pre_dispatch)(*example_input, *pos_args)
 
     next_name = None
     i = 0
@@ -274,13 +274,7 @@ def _unstack_pytree(xs):
             f"Leaves of xs must have same leading dimension size {[xs.shape for xs in flat_xs]}"
         )
 
-    ctx = (
-        FunctionalTensorMode
-        if any(isinstance(x, FunctionalTensor) for x in flat_xs)
-        else nullcontext
-    )
-    with ctx():
-        a = zip(*flat_xs)
+    a = zip(*flat_xs)
 
     pytrees = []
     for tuple in a:
