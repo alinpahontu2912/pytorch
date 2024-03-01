@@ -73,7 +73,7 @@ def check_model(
 ):
     with torch.no_grad(), config.patch(
         {
-            "aot_inductor.abi_compatible": self.abi_compatible,
+            "abi_compatible": self.abi_compatible,
             "allow_stack_allocation": self.allow_stack_allocation,
             "use_minimal_arrayref_interface": self.use_minimal_arrayref_interface,
         }
@@ -107,7 +107,7 @@ def check_model_with_multiple_inputs(
 ):
     with torch.no_grad(), config.patch(
         {
-            "aot_inductor.abi_compatible": self.abi_compatible,
+            "abi_compatible": self.abi_compatible,
             "allow_stack_allocation": self.allow_stack_allocation,
         }
     ):
@@ -478,6 +478,23 @@ class AOTInductorTestsTemplate:
             options={"debug_check_inf_and_nan": True},
         )
 
+    def test_assert_async(self):
+        if self.device != "cuda":
+            raise unittest.SkipTest("requires CUDA")
+
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+
+            def forward(self, x):
+                u0 = x.item()
+                torch._check(u0 > 3)
+                return torch.ones(u0)[0]
+
+        x = torch.tensor(23, device=self.device)
+        example_inputs = (x,)
+        self.check_model(Model(), example_inputs)
+
     def test_simple_dynamic(self):
         class Model(torch.nn.Module):
             def __init__(self):
@@ -819,9 +836,7 @@ class AOTInductorTestsTemplate:
         result_cpu = Model(w1, w2)(*inputs)
 
         # Compile model with AOTInductor
-        with torch.cuda.device(0), config.patch(
-            "aot_inductor.abi_compatible", self.abi_compatible
-        ):
+        with torch.cuda.device(0), config.patch("abi_compatible", self.abi_compatible):
             so_path = AOTIRunnerUtil.compile(
                 model=Model(w1.cuda(0), w2.cuda(0)),
                 example_inputs=tuple(t.cuda(0) for t in inputs),
@@ -870,14 +885,14 @@ class AOTInductorTestsTemplate:
         result_cpu = Model(weight)(*inputs)
 
         with torch.cuda.device(0), torch.no_grad(), config.patch(
-            "aot_inductor.abi_compatible", self.abi_compatible
+            "abi_compatible", self.abi_compatible
         ):
             result_cuda_0 = AOTIRunnerUtil.run(
                 "cuda", Model(weight.cuda(0)), tuple(t.cuda(0) for t in inputs)
             )
 
         with torch.cuda.device(1), torch.no_grad(), config.patch(
-            "aot_inductor.abi_compatible", self.abi_compatible
+            "abi_compatible", self.abi_compatible
         ):
             result_cuda_1 = AOTIRunnerUtil.run(
                 "cuda", Model(weight.cuda(1)), tuple(t.cuda(1) for t in inputs)
@@ -1151,9 +1166,6 @@ class AOTInductorTestsTemplate:
                 super().__init__()
 
             def forward(self, x, y):
-                # AOT export does not allow for input mutation
-                x = x.clone()
-                y = y.clone()
                 output = torch.zeros_like(x)
                 if autotune and num_dims == 2:
                     x_elements = output.size()[0]
@@ -1229,8 +1241,6 @@ class AOTInductorTestsTemplate:
                 super().__init__()
 
             def forward(self, x):
-                # AOT export does not allow for input mutation
-                x = x.clone()
                 num = x.numel() // 4
 
                 grid = lambda meta: (triton.cdiv(num, 16),)  # noqa: E731
@@ -1256,12 +1266,19 @@ class AOTInductorTestsTemplate:
                 super().__init__()
 
             def forward(self, x):
-                # AOT export does not allow for input mutation
-                x = x.clone()
-                pass_kernel[(1,)](x, torch.empty_like(x))
-                return x
+                out = torch.zeros_like(x[:, 4:])
+                # the slicing below creates two ReinterpretView
+                # instances: with offset=3 and offset=4
+                add_kernel[(10,)](
+                    in_ptr0=x[:, 3:-1],
+                    in_ptr1=x[:, 4:],
+                    out_ptr=out,
+                    n_elements=160,
+                    BLOCK_SIZE=16,
+                )
+                return out
 
-        example_inputs = (torch.randn(4, device=self.device),)
+        example_inputs = (torch.randn(10, 20, device=self.device),)
         self.check_model(Model(), example_inputs)
 
     @skipIfRocm
@@ -1274,12 +1291,9 @@ class AOTInductorTestsTemplate:
                 super().__init__()
 
             def forward(self, x, y):
-                # AOT export does not allow for input mutation
                 n_elements = x.size()[0]
                 BLOCK_SIZE = 1024
 
-                x = x.clone()
-                y = y.clone()
                 output_wo_y = torch.empty_like(x)
                 output_with_y = torch.empty_like(x)
 
@@ -1309,6 +1323,25 @@ class AOTInductorTestsTemplate:
 
         self.check_model(Model(), example_inputs)
 
+    @skipIfRocm
+    def test_triton_kernel_equal_to_1_arg(self):
+        if self.device != "cuda":
+            raise unittest.SkipTest("requires CUDA")
+
+        class Model(torch.nn.Module):
+            def forward(self, x, y):
+                out = torch.empty_like(x)
+                n_elements = x.numel()
+                add_kernel[(n_elements,)](x, y, out, n_elements, BLOCK_SIZE=16)
+                return out
+
+        example_inputs = (
+            torch.randn(1, device=self.device),
+            torch.randn(1, device=self.device),
+        )
+
+        self.check_model(Model(), example_inputs)
+
     def test_shifted_constraint_ranges(self):
         class Model(torch.nn.Module):
             def __init__(self):
@@ -1325,13 +1358,12 @@ class AOTInductorTestsTemplate:
         a = torch.randn((4, 5), device=self.device)
         b = torch.randn((5, 5), device=self.device)
         dim0_x = Dim("dim0_x", min=2, max=1024)
-        dim0_y = Dim("dim0_y", min=3, max=1025)
+        dim0_y = dim0_x + 1
         dynamic_shapes = {"x": {0: dim0_x}, "y": {0: dim0_y}}
         self.check_model(
             Model(),
             (a, b),
             dynamic_shapes=dynamic_shapes,
-            disable_constraint_solver=True,
         )
 
     def test_scatter_fallback(self):
@@ -1607,9 +1639,6 @@ class AOTInductorTestsTemplate:
 
         class Model(torch.nn.Module):
             def forward(self, x, y):
-                # AOT export does not allow for input mutation
-                x = x.clone()
-                y = y.clone()
                 out = torch.zeros_like(x)
                 # torch.mm is ExternKernelOut
                 add_kernel[(4,)](x, torch.mm(x, y), out, 4, 16)
@@ -1629,9 +1658,6 @@ class AOTInductorTestsTemplate:
 
         class Model(torch.nn.Module):
             def forward(self, x, y):
-                # AOT export does not allow for input mutation
-                x = x.clone()
-                y = y.clone()
                 out = torch.zeros_like(x)
                 # torch.sort creates fallback kernel and hence MultiOutput
                 add_kernel[(4,)](x, torch.sort(y).values, out, 4, 16)
@@ -1645,7 +1671,7 @@ class AOTInductorTestsTemplate:
         self.check_model(Model(), example_inputs)
 
     @skipIfRocm
-    @config.patch({"aot_inductor.abi_compatible": True})
+    @config.patch({"abi_compatible": True})
     def test_triton_kernel_reinterpret_view_mem_leak(self):
         # Check for memory leak when using user-defined Triton Kernel + AOTI.
         if self.device != "cuda":

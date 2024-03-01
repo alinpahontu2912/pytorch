@@ -4060,7 +4060,7 @@ def interpolate(input: Tensor, size: Optional[int] = None, scale_factor: Optiona
                 # Use slow decomp whose backward will be in terms of index_put
                 # importlib is required because the import cannot be top level
                 # (cycle) and cannot be nested (TS doesn't support)
-                return importlib.import_module('torch._decomp.decompositions').upsample_bilinear2d_vec(
+                return importlib.import_module('torch._decomp.decompositions')._upsample_linear_vec(
                     input, output_size, align_corners, scale_factors)
         return torch._C._nn.upsample_bilinear2d(input, output_size, align_corners, scale_factors)
     if input.dim() == 5 and mode == "trilinear":
@@ -4971,7 +4971,6 @@ greater than 0.0 is specified. The optional scale argument can only be specified
 
     # Efficient implementation equivalent to the following:
     def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None) -> torch.Tensor:
-        # Efficient implementation equivalent to the following:
         L, S = query.size(-2), key.size(-2)
         scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale
         attn_bias = torch.zeros(L, S, dtype=query.dtype)
@@ -5033,7 +5032,8 @@ Args:
     query (Tensor): Query tensor; shape :math:`(N, ..., L, E)`.
     key (Tensor): Key tensor; shape :math:`(N, ..., S, E)`.
     value (Tensor): Value tensor; shape :math:`(N, ..., S, Ev)`.
-    attn_mask (optional Tensor): Attention mask; shape :math:`(N, ..., L, S)`. Two types of masks are supported.
+    attn_mask (optional Tensor): Attention mask; shape must be broadcastable to the shape of attention weights,
+        which is :math:`(N,..., L, S)`. Two types of masks are supported.
         A boolean mask where a value of True indicates that the element *should* take part in attention.
         A float mask of the same type as query, key, value that is added to the attention score.
     dropout_p (float): Dropout probability; if greater than 0.0, dropout is applied
@@ -5459,7 +5459,7 @@ def multi_head_attention_forward(
 
     if need_weights:
         B, Nt, E = q.shape
-        q_scaled = q / math.sqrt(E)
+        q_scaled = q * math.sqrt(1.0 / float(E))
 
         assert not (is_causal and attn_mask is None), "FIXME: is_causal not implemented for need_weights"
 
