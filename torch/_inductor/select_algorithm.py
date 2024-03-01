@@ -3,9 +3,11 @@ import functools
 import inspect
 import itertools
 import logging
+import operator
 import sys
 import textwrap
 import time
+from concurrent.futures import ThreadPoolExecutor
 from io import StringIO
 
 from typing import Any, Callable, Dict, List, Optional, Type, Union
@@ -24,7 +26,14 @@ from .codegen.common import ChoiceCaller, IndentedBuffer, KernelTemplate
 from .codegen.triton import texpr, TritonKernel, TritonPrinter, TritonScheduling
 from .codegen.triton_utils import config_of, signature_to_meta
 from .exc import CUDACompileError
-from .utils import do_bench, Placeholder, sympy_dot, sympy_product, unique
+from .utils import (
+    do_bench,
+    get_dtype_size,
+    Placeholder,
+    sympy_dot,
+    sympy_product,
+    unique,
+)
 from .virtualized import V
 
 log = logging.getLogger(__name__)
@@ -105,9 +114,25 @@ class TritonTemplateKernel(TritonKernel):
         self.suffix_args = suffix_args
         self.epilogue_fn = epilogue_fn
         self.render_hooks = dict()
+        self.triton_meta: Optional[Dict[str, object]] = None
 
     def need_numel_args(self):
         return False
+
+    def estimate_kernel_num_bytes(self):
+        """
+        Estimate the total number of bytes this kernel takes.
+        For in/out nodes, sizes are counted twice: once for reading and
+        once for writing.
+        """
+        ninplace_args = len(unique(self.args.inplace_buffers.values()))
+        num_bytes = []
+        for i, inp in enumerate(itertools.chain(self.input_nodes, (self.output_node,))):
+            size = V.graph.sizevars.size_hints(inp.get_size())
+            numel = functools.reduce(operator.mul, size)
+            dtype_size = get_dtype_size(inp.get_dtype())
+            num_bytes.append(numel * dtype_size * (1 + int(i < ninplace_args)))
+        return sum(num_bytes)
 
     def jit_line(self):
         if self.use_jit:
@@ -121,8 +146,16 @@ class TritonTemplateKernel(TritonKernel):
             "constants": {},
         }
         triton_meta["configs"] = [config_of(signature)]
+        for arg_num in triton_meta["configs"][0].equal_to_1:  # type: ignore[index]
+            triton_meta["constants"][arg_num] = 1  # type: ignore[index]
+        self.triton_meta = triton_meta
 
-        inductor_meta = {"kernel_name": str(Placeholder.DESCRIPTIVE_NAME)}
+        inductor_meta = {
+            "kernel_name": str(Placeholder.DESCRIPTIVE_NAME),
+        }
+        if config.profile_bandwidth or config.benchmark_kernel:
+            num_gb = self.estimate_kernel_num_bytes() / 1e9
+            inductor_meta["kernel_num_gb"] = num_gb
         return textwrap.dedent(
             f"""
             @template(
@@ -376,6 +409,7 @@ class TritonTemplateKernel(TritonKernel):
                 call_args,
                 device_index=V.graph.scheduler.current_device.index,
                 grid=grid,
+                triton_meta=self.triton_meta,
             )
         else:
             stream_name = wrapper.write_get_raw_stream(
@@ -533,6 +567,7 @@ class TritonTemplate(KernelTemplate):
             extra_args=extra_args,
             num_stages=num_stages,
             num_warps=num_warps,
+            matrix_instr_nonkdim=kwargs.get("matrix_instr_nonkdim", 0),
             input_tensor_meta=TensorMeta.from_irnodes(input_nodes),
             output_tensor_meta=TensorMeta.from_irnodes(layout),
         )
@@ -555,6 +590,7 @@ class ExternKernelChoice:
         *,
         name=None,
         has_out_variant=True,
+        op_overload=None,
     ):
         super().__init__()
         name = name or kernel.__name__
@@ -564,6 +600,7 @@ class ExternKernelChoice:
         self.cpp_kernel_name = cpp_kernel
         self.has_out_variant = has_out_variant
         setattr(extern_kernels, name, kernel)
+        self.op_overload = op_overload
 
     def to_callable(self):
         return getattr(extern_kernels, self.name)
@@ -585,7 +622,13 @@ class ExternKernelChoice:
             pass
         return code_hash("-".join(parts))
 
-    def bind(self, input_nodes, layout, ordered_kwargs_for_cpp_kernel=(), **kwargs):
+    def bind(
+        self,
+        input_nodes,
+        layout,
+        ordered_kwargs_for_cpp_kernel=(),
+        **kwargs,
+    ):
         self.ordered_kwargs_for_cpp_kernel = ordered_kwargs_for_cpp_kernel
         return ExternKernelCaller(
             self, input_nodes, layout, kwargs, has_out_variant=self.has_out_variant
@@ -691,6 +734,7 @@ class ExternKernelCaller(ChoiceCaller):
                 python_kernel_name=self.choice.call_name(),
                 cpp_kernel_name=self.choice.cpp_kernel_name,
                 ordered_kwargs_for_cpp_kernel=self.choice.ordered_kwargs_for_cpp_kernel,
+                op_overload=self.choice.op_overload,
                 kwargs=self.kwargs,
             )
         )
@@ -716,6 +760,7 @@ class AlgorithmSelectorCache(PersistentCache):
         # arg, the function will be called instead of
         # generating a random torch.Tensor for benchmarking.
         input_gen_fns: Optional[Dict[int, Callable[[ir.Buffer], torch.Tensor]]] = None,
+        precompilation_timeout_seconds: int = 60 * 60,
     ):
         from .codegen.cuda.cuda_kernel import CUDATemplateCaller
 
@@ -737,7 +782,55 @@ class AlgorithmSelectorCache(PersistentCache):
         def make_benchmark_fn():
             return self.make_benchmark_fn(choices, input_nodes, layout, input_gen_fns)
 
+        def precompile(choices):
+            if (
+                precompilation_timeout_seconds is None
+                or precompilation_timeout_seconds <= 0
+            ):
+                return
+            num_workers = min(
+                config.compile_threads,
+                torch.get_num_threads(),
+                len(choices),
+            )
+            if num_workers <= 0:
+                return
+            log.info(
+                "Multithreaded precompilation for %d choices using %d worker threads",
+                len(choices),
+                num_workers,
+            )
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                futures = executor.map(
+                    lambda c: c.precompile(),
+                    [c for c in choices if hasattr(c, "precompile")],
+                    timeout=precompilation_timeout_seconds,
+                )
+                try:
+                    iterator = iter(futures)
+                    while True:
+                        try:
+                            next(iterator)
+                        except CUDACompileError:
+                            log.error(  # noqa: G201
+                                "CUDA Compilation error", exc_info=True
+                            )
+                except TimeoutError:
+                    log.warning(
+                        f"Precompilation timed out after {precompilation_timeout_seconds} seconds."  # noqa: G004
+                    )
+                except StopIteration:
+                    pass
+                executor.shutdown(wait=True)
+
         def autotune(choices):
+            try:
+                precompile(choices)
+            except TimeoutError:
+                log.warning(
+                    "Precompilation phase took longer than timeout allowed. Continuing"
+                )
+                pass
             return make_benchmark_fn()(choices)
 
         if config.autotune_in_subproc:
@@ -983,7 +1076,7 @@ class AlgorithmSelectorCache(PersistentCache):
         )
 
 
-_ALGORITHM_SELECTOR_CACHE = None
+_ALGORITHM_SELECTOR_CACHE: Optional[AlgorithmSelectorCache] = None
 
 
 def autotune_select_algorithm(*args, **kwargs):
