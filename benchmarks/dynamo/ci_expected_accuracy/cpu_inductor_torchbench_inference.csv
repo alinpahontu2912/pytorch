@@ -54,47 +54,47 @@ densenet121,pass,0
 
 
 
-detectron2_fasterrcnn_r_101_c4,pass,52
+detectron2_fasterrcnn_r_101_c4,pass,51
 
 
 
-detectron2_fasterrcnn_r_101_dc5,pass,52
+detectron2_fasterrcnn_r_101_dc5,pass,51
 
 
 
-detectron2_fasterrcnn_r_101_fpn,pass,56
+detectron2_fasterrcnn_r_101_fpn,pass,55
 
 
 
-detectron2_fasterrcnn_r_50_c4,pass,52
+detectron2_fasterrcnn_r_50_c4,pass,51
 
 
 
-detectron2_fasterrcnn_r_50_dc5,pass,52
+detectron2_fasterrcnn_r_50_dc5,pass,51
 
 
 
-detectron2_fasterrcnn_r_50_fpn,pass,56
+detectron2_fasterrcnn_r_50_fpn,pass,55
 
 
 
-detectron2_fcos_r_50_fpn,pass,44
+detectron2_fcos_r_50_fpn,pass,38
 
 
 
-detectron2_maskrcnn_r_101_c4,fail_accuracy,67
+detectron2_maskrcnn_r_101_c4,fail_accuracy,66
 
 
 
-detectron2_maskrcnn_r_101_fpn,pass,74
+detectron2_maskrcnn_r_101_fpn,pass,73
 
 
 
-detectron2_maskrcnn_r_50_c4,pass,67
+detectron2_maskrcnn_r_50_c4,pass,66
 
 
 
-detectron2_maskrcnn_r_50_fpn,pass,74
+detectron2_maskrcnn_r_50_fpn,pass,73
 
 
 
@@ -131,6 +131,14 @@ hf_Albert,pass,0
 
 
 hf_Bart,pass,0
+
+
+
+hf_Bert,pass,0
+
+
+
+hf_Bert_large,pass,0
 
 
 
@@ -174,6 +182,10 @@ llama,pass,0
 
 
 
+maml,pass_due_to_skip,0
+
+
+
 maml_omniglot,pass,0
 
 
@@ -186,7 +198,7 @@ mobilenet_v2,pass,0
 
 
 
-mobilenet_v2_quantized_qat,eager_fail_to_run,0
+mobilenet_v2_quantized_qat,pass,2
 
 
 
@@ -250,7 +262,7 @@ resnet50,pass,0
 
 
 
-resnet50_quantized_qat,eager_fail_to_run,0
+resnet50_quantized_qat,pass,2
 
 
 
@@ -322,7 +334,7 @@ vgg16,pass,0
 
 
 
-vision_maskrcnn,pass,29
+vision_maskrcnn,pass,28
 
 
 
